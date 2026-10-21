@@ -27,7 +27,7 @@ jobs:
           INSTABOX_API_URL: https://api.instabox.sh
           INSTABOX_SSH_HOST: api.instabox.sh
           INSTABOX_SSH_PORT: '2222'
-          INSTABOX_SSH_USER: ibssh_bqzivxvwarguxbrybvy74sa5f4
+          INSTABOX_SSH_USER: ibssh_3gzc4jpx7fuix6bduacjvqgylq
           PROXY_HOST: 8443-agqvx7j2hautskdu3rml3giune.instabox.tech
           PROXY_PATH: /v1s2n8x4q7
           PANEL_HOST: 2053-agqvx7j2hautskdu3rml3giune.instabox.tech
