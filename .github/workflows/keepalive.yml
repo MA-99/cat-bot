@@ -1,0 +1,147 @@
+name: InstaBox Keepalive
+
+on:
+  schedule:
+    # 每 9 分钟续租一次，防止机器空闲休眠
+    - cron: '*/9 * * * *'
+  workflow_dispatch:
+    inputs:
+      machine:
+        description: '机器名或 ID（留空 = 全部机器）'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Renew activity leases
+        env:
+          INSTABOX_API_KEY: ${{ secrets.INSTABOX_API_KEY }}
+          INSTABOX_API_URL: https://api.instabox.sh
+          INSTABOX_LEASE: keepalive
+          INSTABOX_LEASE_TTL: '300'
+          MACHINE: ${{ github.event.inputs.machine }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$INSTABOX_API_KEY" ]; then
+            echo "❌ 未配置 INSTABOX_API_KEY secret"
+            exit 1
+          fi
+
+          API="$INSTABOX_API_URL"
+          KEY="$INSTABOX_API_KEY"
+          LEASE="$INSTABOX_LEASE"
+          TTL="$INSTABOX_LEASE_TTL"
+
+          echo "=== InstaBox Keepalive $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
+          echo "API: $API"
+          echo "Lease: $LEASE  TTL: ${TTL}s"
+          echo ""
+
+          # 获取机器列表
+          RESP=$(curl -sf -m 30 -X GET "$API/v1/machines" \
+            -H "X-API-Key: $KEY" \
+            -H "Accept: application/json" \
+            -w '\n%{http_code}' 2>&1) || {
+            echo "❌ 获取机器列表失败"
+            exit 1
+          }
+
+          HTTP_CODE=$(echo "$RESP" | tail -1)
+          BODY=$(echo "$RESP" | sed '$d')
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ API 返回 HTTP $HTTP_CODE"
+            echo "$BODY"
+            exit 1
+          fi
+
+          # 解析机器列表
+          MACHINES=$(echo "$BODY" | python3 -c "
+          import json, sys, os
+          data = json.load(sys.stdin)
+          machines = data.get('machines') or []
+          target = os.environ.get('MACHINE', '').strip()
+          for m in machines:
+              mid = m.get('id', '')
+              name = m.get('name', '')
+              state = m.get('state', '')
+              if target and target not in (name, mid, 'all', 'ALL'):
+                  continue
+              print(f'{mid}\t{name}\t{state}')
+          ")
+
+          if [ -z "$MACHINES" ]; then
+            echo "⚠️ 没有找到匹配的机器"
+            exit 0
+          fi
+
+          echo "找到 $(echo "$MACHINES" | wc -l) 台机器："
+          echo "$MACHINES" | while IFS=$'\t' read -r mid name state; do
+            echo "  - $name ($mid) [$state]"
+          done
+          echo ""
+
+          # 逐台续租
+          FAIL=0
+          echo "$MACHINES" | while IFS=$'\t' read -r mid name state; do
+            echo "--- 续租 $name ($mid) ---"
+
+            # 如果机器不是 running，先尝试唤醒
+            if [ "$state" != "running" ]; then
+              echo "  机器状态: $state，尝试唤醒..."
+              IDEM="ka-resume-$mid-$(date +%s)"
+              WC=$(curl -s -m 30 -X POST "$API/v1/machines/$mid/resume" \
+                -H "X-API-Key: $KEY" \
+                -H "Idempotency-Key: $IDEM" \
+                -o /dev/null -w '%{http_code}' 2>/dev/null) || WC=0
+              echo "  resume -> HTTP $WC"
+
+              if [ "$WC" != "202" ] && [ "$WC" != "200" ]; then
+                IDEM="ka-start-$mid-$(date +%s)"
+                WC=$(curl -s -m 30 -X POST "$API/v1/machines/$mid/start" \
+                  -H "X-API-Key: $KEY" \
+                  -H "Idempotency-Key: $IDEM" \
+                  -o /dev/null -w '%{http_code}' 2>/dev/null) || WC=0
+                echo "  start -> HTTP $WC"
+              fi
+
+              # 等待机器启动
+              for i in 1 2 3 4 5; do
+                sleep 5
+                ST=$(curl -sf -m 10 "$API/v1/machines/$mid" \
+                  -H "X-API-Key: $KEY" 2>/dev/null | \
+                  python3 -c "import json,sys; print(json.load(sys.stdin).get('state',''))" 2>/dev/null) || ST=""
+                echo "  等待启动... ($i) state=$ST"
+                if [ "$ST" = "running" ]; then
+                  break
+                fi
+              done
+            fi
+
+            # 续租
+            RENEW_RESP=$(curl -s -m 30 -X PUT "$API/v1/machines/$mid/activity-leases/$LEASE" \
+              -H "X-API-Key: $KEY" \
+              -H "Content-Type: application/json" \
+              -d "{\"ttlSeconds\":$TTL}" \
+              -w '\n%{http_code}' 2>&1)
+
+            RENEW_CODE=$(echo "$RENEW_RESP" | tail -1)
+            RENEW_BODY=$(echo "$RENEW_RESP" | sed '$d')
+
+            if [ "$RENEW_CODE" = "200" ] || [ "$RENEW_CODE" = "204" ]; then
+              EXPIRES=$(echo "$RENEW_BODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('expiresAt','?'))" 2>/dev/null || echo "?")
+              echo "  ✅ 续租成功，到期: $EXPIRES"
+            else
+              echo "  ❌ 续租失败 HTTP $RENEW_CODE: $RENEW_BODY"
+            fi
+            echo ""
+          done
+
+          echo "=== 完成 $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
