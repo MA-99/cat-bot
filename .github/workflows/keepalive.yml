@@ -2,146 +2,252 @@ name: InstaBox Keepalive
 
 on:
   schedule:
-    # 每 9 分钟续租一次，防止机器空闲休眠
+    # 每 9 分钟续租 + 健康检查
     - cron: '*/9 * * * *'
   workflow_dispatch:
     inputs:
-      machine:
-        description: '机器名或 ID（留空 = 全部机器）'
+      action:
+        description: '执行动作：keepalive（默认）| healthcheck | restart'
         required: false
-        default: ''
+        default: 'keepalive'
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   keepalive:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
     steps:
-      - name: Renew activity leases
+      - name: Keepalive + Health Check + Auto-Recovery
         env:
           INSTABOX_API_KEY: ${{ secrets.INSTABOX_API_KEY }}
+          INSTABOX_SSH_KEY: ${{ secrets.INSTABOX_SSH_KEY }}
           INSTABOX_API_URL: https://api.instabox.sh
-          INSTABOX_LEASE: keepalive
-          INSTABOX_LEASE_TTL: '300'
-          MACHINE: ${{ github.event.inputs.machine }}
+          INSTABOX_SSH_HOST: api.instabox.sh
+          INSTABOX_SSH_PORT: '2222'
+          INSTABOX_SSH_USER: ibssh_bqzivxvwarguxbrybvy74sa5f4
+          PROXY_HOST: 8443-agqvx7j2hautskdu3rml3giune.instabox.tech
+          PROXY_PATH: /v1s2n8x4q7
+          PANEL_HOST: 2053-agqvx7j2hautskdu3rml3giune.instabox.tech
+          ACTION: ${{ github.event.inputs.action }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-
-          if [ -z "$INSTABOX_API_KEY" ]; then
-            echo "❌ 未配置 INSTABOX_API_KEY secret"
-            exit 1
-          fi
-
           API="$INSTABOX_API_URL"
           KEY="$INSTABOX_API_KEY"
-          LEASE="$INSTABOX_LEASE"
-          TTL="$INSTABOX_LEASE_TTL"
+          NOW=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          echo "=== InstaBox Keepalive $NOW ==="
 
-          echo "=== InstaBox Keepalive $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
-          echo "API: $API"
-          echo "Lease: $LEASE  TTL: ${TTL}s"
-          echo ""
-
-          # 获取机器列表
+          # ============================================================
+          # 1. 获取机器列表 + 续租
+          # ============================================================
           RESP=$(curl -sf -m 30 -X GET "$API/v1/machines" \
-            -H "X-API-Key: $KEY" \
-            -H "Accept: application/json" \
-            -w '\n%{http_code}' 2>&1) || {
-            echo "❌ 获取机器列表失败"
-            exit 1
-          }
-
+            -H "X-API-Key: $KEY" -H "Accept: application/json" \
+            -w '\n%{http_code}') || { echo "❌ 获取机器列表失败"; exit 1; }
           HTTP_CODE=$(echo "$RESP" | tail -1)
           BODY=$(echo "$RESP" | sed '$d')
+          [ "$HTTP_CODE" = "200" ] || { echo "❌ API 返回 $HTTP_CODE"; exit 1; }
 
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "❌ API 返回 HTTP $HTTP_CODE"
-            echo "$BODY"
-            exit 1
-          fi
-
-          # 解析机器列表
-          MACHINES=$(echo "$BODY" | python3 -c "
-          import json, sys, os
+          # 解析机器
+          MACHINE_INFO=$(echo "$BODY" | python3 -c "
+          import json, sys
           data = json.load(sys.stdin)
-          machines = data.get('machines') or []
-          target = os.environ.get('MACHINE', '').strip()
-          for m in machines:
-              mid = m.get('id', '')
-              name = m.get('name', '')
-              state = m.get('state', '')
-              if target and target not in (name, mid, 'all', 'ALL'):
-                  continue
-              print(f'{mid}\t{name}\t{state}')
+          for m in (data.get('machines') or []):
+              print(f\"{m['id']}\t{m.get('name','')}\t{m.get('state','')}\")
           ")
+          echo "$MACHINE_INFO" | while IFS=$'\t' read -r mid name state; do
+            echo "  机器: $name ($mid) [$state]"
+          done
 
-          if [ -z "$MACHINES" ]; then
-            echo "⚠️ 没有找到匹配的机器"
-            exit 0
+          # 取第一台机器
+          MID=$(echo "$MACHINE_INFO" | head -1 | cut -f1)
+          MNAME=$(echo "$MACHINE_INFO" | head -1 | cut -f2)
+          MSTATE=$(echo "$MACHINE_INFO" | head -1 | cut -f3)
+
+          # 续租
+          RENEW=$(curl -s -m 30 -X PUT "$API/v1/machines/$MID/activity-leases/keepalive" \
+            -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+            -d '{"ttlSeconds":300}' -w '\n%{http_code}')
+          RCODE=$(echo "$RENEW" | tail -1)
+          if [ "$RCODE" = "200" ] || [ "$RCODE" = "204" ]; then
+            echo "✅ 续租成功"
+          else
+            echo "❌ 续租失败 HTTP $RCODE"
           fi
 
-          echo "找到 $(echo "$MACHINES" | wc -l) 台机器："
-          echo "$MACHINES" | while IFS=$'\t' read -r mid name state; do
-            echo "  - $name ($mid) [$state]"
-          done
+          # 如果只是 healthcheck 或 restart，跳过续租后的逻辑
+          if [ "${ACTION:-}" = "restart" ]; then
+            echo "=== 手动触发重启 ==="
+            MSTATE="needs-restart"
+          fi
+
+          # ============================================================
+          # 2. 代理健康检查
+          # ============================================================
           echo ""
+          echo "--- 代理健康检查 ---"
+          WS_CODE=$(curl -s -o /dev/null -m 10 -w '%{http_code}' \
+            -H "Upgrade: websocket" -H "Connection: Upgrade" \
+            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+            -H "Sec-WebSocket-Version: 13" \
+            "https://$PROXY_HOST$PROXY_PATH" 2>/dev/null) || WS_CODE="000"
 
-          # 逐台续租
-          FAIL=0
-          echo "$MACHINES" | while IFS=$'\t' read -r mid name state; do
-            echo "--- 续租 $name ($mid) ---"
+          PANEL_CODE=$(curl -s -o /dev/null -m 10 -w '%{http_code}' \
+            "https://$PANEL_HOST/" 2>/dev/null) || PANEL_CODE="000"
 
-            # 如果机器不是 running，先尝试唤醒
-            if [ "$state" != "running" ]; then
-              echo "  机器状态: $state，尝试唤醒..."
-              IDEM="ka-resume-$mid-$(date +%s)"
-              WC=$(curl -s -m 30 -X POST "$API/v1/machines/$mid/resume" \
-                -H "X-API-Key: $KEY" \
-                -H "Idempotency-Key: $IDEM" \
-                -o /dev/null -w '%{http_code}' 2>/dev/null) || WC=0
-              echo "  resume -> HTTP $WC"
+          echo "  代理 WebSocket: HTTP $WS_CODE (期望 101)"
+          echo "  面板: HTTP $PANEL_CODE (期望 200)"
 
-              if [ "$WC" != "202" ] && [ "$WC" != "200" ]; then
-                IDEM="ka-start-$mid-$(date +%s)"
-                WC=$(curl -s -m 30 -X POST "$API/v1/machines/$mid/start" \
-                  -H "X-API-Key: $KEY" \
-                  -H "Idempotency-Key: $IDEM" \
-                  -o /dev/null -w '%{http_code}' 2>/dev/null) || WC=0
-                echo "  start -> HTTP $WC"
-              fi
+          PROXY_OK=false
+          [ "$WS_CODE" = "101" ] && PROXY_OK=true
 
-              # 等待机器启动
-              for i in 1 2 3 4 5; do
-                sleep 5
-                ST=$(curl -sf -m 10 "$API/v1/machines/$mid" \
+          # ============================================================
+          # 3. 自动恢复
+          # ============================================================
+          RECOVERY_MSG=""
+          if [ "$PROXY_OK" = "false" ]; then
+            echo ""
+            echo "⚠️ 代理不可达，启动恢复流程..."
+
+            # 3a. 如果机器不在 running，尝试唤醒
+            if [ "$MSTATE" != "running" ] && [ "$MSTATE" != "needs-restart" ]; then
+              echo "  机器状态: $MSTATE，尝试唤醒..."
+              curl -s -m 30 -X POST "$API/v1/machines/$MID/resume" \
+                -H "X-API-Key: $KEY" -o /dev/null -w "  resume -> HTTP %{http_code}\n" 2>/dev/null || \
+              curl -s -m 30 -X POST "$API/v1/machines/$MID/start" \
+                -H "X-API-Key: $KEY" -o /dev/null -w "  start -> HTTP %{http_code}\n" 2>/dev/null
+
+              # 等待启动
+              for i in 1 2 3 4 5 6; do
+                sleep 10
+                ST=$(curl -sf -m 10 "$API/v1/machines/$MID" \
                   -H "X-API-Key: $KEY" 2>/dev/null | \
                   python3 -c "import json,sys; print(json.load(sys.stdin).get('state',''))" 2>/dev/null) || ST=""
-                echo "  等待启动... ($i) state=$ST"
-                if [ "$ST" = "running" ]; then
-                  break
-                fi
+                echo "  等待... ($i) state=$ST"
+                [ "$ST" = "running" ] && break
               done
             fi
 
-            # 续租
-            RENEW_RESP=$(curl -s -m 30 -X PUT "$API/v1/machines/$mid/activity-leases/$LEASE" \
-              -H "X-API-Key: $KEY" \
-              -H "Content-Type: application/json" \
-              -d "{\"ttlSeconds\":$TTL}" \
-              -w '\n%{http_code}' 2>&1)
-
-            RENEW_CODE=$(echo "$RENEW_RESP" | tail -1)
-            RENEW_BODY=$(echo "$RENEW_RESP" | sed '$d')
-
-            if [ "$RENEW_CODE" = "200" ] || [ "$RENEW_CODE" = "204" ]; then
-              EXPIRES=$(echo "$RENEW_BODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('expiresAt','?'))" 2>/dev/null || echo "?")
-              echo "  ✅ 续租成功，到期: $EXPIRES"
-            else
-              echo "  ❌ 续租失败 HTTP $RENEW_CODE: $RENEW_BODY"
+            # 3b. 如果是手动重启请求
+            if [ "$MSTATE" = "needs-restart" ]; then
+              echo "  手动重启机器..."
+              curl -s -m 30 -X POST "$API/v1/machines/$MID/restart" \
+                -H "X-API-Key: $KEY" -o /dev/null -w "  restart -> HTTP %{http_code}\n" 2>/dev/null
+              sleep 30
             fi
-            echo ""
-          done
 
+            # 3c. SSH 恢复（如果有 SSH key）
+            if [ -n "$INSTABOX_SSH_KEY" ]; then
+              echo "  通过 SSH 恢复..."
+              mkdir -p ~/.ssh
+              echo "$INSTABOX_SSH_KEY" > ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              ssh-keyscan -p "$INSTABOX_SSH_PORT" "$INSTABOX_SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+              SSH_CMD="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p $INSTABOX_SSH_PORT $INSTABOX_SSH_USER@$INSTABOX_SSH_HOST"
+
+              # 检查 Docker
+              echo "  检查 Docker 容器..."
+              DOCKER_STATUS=$($SSH_CMD 'docker ps --format "{{.Names}} {{.Status}}" 2>/dev/null' 2>/dev/null) || DOCKER_STATUS=""
+              echo "  Docker: $DOCKER_STATUS"
+
+              if echo "$DOCKER_STATUS" | grep -q "3x-ui.*Up"; then
+                echo "  容器正常运行，重新发布端口..."
+                $SSH_CMD 'instabox-port publish 2053 --name 3xui-panel 2>/dev/null; instabox-port publish 8443 --name vless-ws 2>/dev/null' 2>/dev/null
+                RECOVERY_MSG="端口已重新发布"
+              else
+                echo "  容器异常，尝试重启..."
+                $SSH_CMD 'docker restart 3x-ui 2>/dev/null; sleep 5; instabox-port publish 2053 --name 3xui-panel 2>/dev/null; instabox-port publish 8443 --name vless-ws 2>/dev/null' 2>/dev/null
+                RECOVERY_MSG="Docker 已重启，端口已重新发布"
+              fi
+            else
+              RECOVERY_MSG="无 SSH key，仅执行了 API 级恢复。如需自动重发布端口，请添加 INSTABOX_SSH_KEY secret"
+            fi
+
+            # 3d. 再次检查
+            sleep 5
+            WS_CODE2=$(curl -s -o /dev/null -m 10 -w '%{http_code}' \
+              -H "Upgrade: websocket" -H "Connection: Upgrade" \
+              -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+              -H "Sec-WebSocket-Version: 13" \
+              "https://$PROXY_HOST$PROXY_PATH" 2>/dev/null) || WS_CODE2="000"
+            echo "  恢复后检查: HTTP $WS_CODE2"
+
+            if [ "$WS_CODE2" = "101" ]; then
+              echo "  ✅ 代理已恢复"
+              PROXY_OK=true
+              RECOVERY_MSG="✅ 已自动恢复: $RECOVERY_MSG"
+            else
+              echo "  ❌ 代理仍未恢复"
+              RECOVERY_MSG="❌ 恢复失败: $RECOVERY_MSG"
+            fi
+          fi
+
+          # ============================================================
+          # 4. 通知（通过 GitHub Issue）
+          # ============================================================
+          if [ "$PROXY_OK" = "false" ]; then
+            echo ""
+            echo "--- 创建告警 Issue ---"
+            # 检查是否已有 open 的告警 issue
+            EXISTING=$(curl -sf -m 10 "https://api.github.com/repos/${{ github.repository }}/issues?state=open&labels=keepalive-alert" \
+              -H "Authorization: token $GH_TOKEN" 2>/dev/null | python3 -c "
+              import json, sys
+              issues = json.load(sys.stdin)
+              print(issues[0]['number'] if issues else '')
+              " 2>/dev/null) || EXISTING=""
+
+            BODY=$(cat << EOF
+          ## ⚠️ InstaBox 代理不可达
+
+          **时间**: $NOW
+          **机器**: $MNAME ($MID)
+          **代理 WebSocket**: HTTP $WS_CODE
+          **面板**: HTTP $PANEL_CODE
+
+          **恢复操作**: $RECOVERY_MSG
+
+          ---
+          此 Issue 由 keepalive workflow 自动创建。
+          代理恢复后会自动关闭。
+          EOF
+          )
+
+            if [ -n "$EXISTING" ]; then
+              curl -sf -m 10 -X POST \
+                "https://api.github.com/repos/${{ github.repository }}/issues/$EXISTING/comments" \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"body\": \"更新 $NOW: $RECOVERY_MSG\"}" 2>/dev/null && \
+                echo "  已更新现有 Issue #$EXISTING"
+            else
+              curl -sf -m 10 -X POST \
+                "https://api.github.com/repos/${{ github.repository }}/issues" \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"title\":\"⚠️ 代理不可达告警\",\"body\":$(python3 -c "import json; print(json.dumps(open('/dev/stdin').read()))" <<< "$BODY"),\"labels\":[\"keepalive-alert\",\"bug\"]}" 2>/dev/null && \
+                echo "  已创建新告警 Issue"
+            fi
+          else
+            # 代理正常，关闭已有的告警 issue
+            EXISTING=$(curl -sf -m 10 "https://api.github.com/repos/${{ github.repository }}/issues?state=open&labels=keepalive-alert" \
+              -H "Authorization: token $GH_TOKEN" 2>/dev/null | python3 -c "
+              import json, sys
+              issues = json.load(sys.stdin)
+              print(issues[0]['number'] if issues else '')
+              " 2>/dev/null) || EXISTING=""
+
+            if [ -n "$EXISTING" ]; then
+              curl -sf -m 10 -X PATCH \
+                "https://api.github.com/repos/${{ github.repository }}/issues/$EXISTING" \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"state\":\"closed\",\"labels\":[\"keepalive-alert\",\"resolved\"]}" 2>/dev/null && \
+                echo "  ✅ 代理已恢复，关闭告警 Issue #$EXISTING"
+            fi
+          fi
+
+          echo ""
           echo "=== 完成 $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
