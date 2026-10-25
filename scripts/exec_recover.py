@@ -62,7 +62,8 @@ except Exception as e:
 for m in machines:
     if m.get("state") != "running":
         continue
-    mid, name = m["id"], m.get("name", mid)
+    mid = m["id"]
+    name = m.get("name", mid)
 
     out, _ = api_exec(mid, "docker ps -a --format '{{.Names}} {{.Status}}' 2>/dev/null")
     if "3x-ui" not in out:
@@ -81,11 +82,13 @@ for m in machines:
     vless_port, _ = api_exec(mid, """docker exec 3x-ui sqlite3 /etc/x-ui/x-ui.db "SELECT port FROM inbounds WHERE enable=1 LIMIT 1;" 2>/dev/null""")
     panel_port = panel_port.strip()
     vless_port = vless_port.strip()
-    log(f"  面板端口={panel_port}, vless端口={vless_port}")
 
-    if not panel_port or not vless_port:
-        log("  无法读取端口，跳过端口转发修正")
-        break
+    # sqlite3 可能不存在（不同镜像），跳过这台继续找下一台
+    if not panel_port or not vless_port or "failed" in panel_port.lower() or "failed" in vless_port.lower() or "error" in panel_port.lower() or "error" in vless_port.lower():
+        log(f"  无法读取端口（sqlite3 可能不存在），跳过 {name}")
+        continue
+
+    log(f"  面板端口={panel_port}, vless端口={vless_port}")
 
     # 4. 比对端口转发
     ports_out, _ = api_exec(mid, "instabox-port list 2>/dev/null")
