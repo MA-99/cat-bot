@@ -223,13 +223,15 @@ elif [ "$PROXY_OK" = "false" ]; then
 		done
 	fi
 
-	# b. SSH 级恢复（容器 + 端口重发布）
-	if ssh_recovery; then
-		: # SSH_MSG 已在函数内设置
+	# b. API exec 恢复（优先，不需要 SSH key）+ SSH fallback
+	log "  通过 API exec 恢复 3x-ui..."
+	if python3 scripts/exec_recover.py 2>&1; then
+		RECOVERY_MSG="API exec 恢复完成"
+	elif ssh_recovery; then
+		[ -n "${SSH_MSG:-}" ] && RECOVERY_MSG="$SSH_MSG"
 	else
-		SSH_MSG="无 SSH key，仅执行 API 级恢复"
+		RECOVERY_MSG="恢复失败（exec + SSH 均失败）"
 	fi
-	[ -n "${SSH_MSG:-}" ] && RECOVERY_MSG="$SSH_MSG"
 
 	# c. 复检
 	sleep 5

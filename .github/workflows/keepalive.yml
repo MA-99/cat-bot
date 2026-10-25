@@ -97,12 +97,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          # 旧版硬编码的地址作为默认值（仓库未配置 vars 时兜底）
-          export PROXY_HOST="${PROXY_HOST:-8443-agqvx7j2hautskdu3rml3giune.instabox.tech}"
-          export PROXY_PATH="${PROXY_PATH:-/v1s2n8x4q7}"
-          export PANEL_HOST="${PANEL_HOST:-2053-agqvx7j2hautskdu3rml3giune.instabox.tech}"
+          # 代理地址从 Variables 读取（PROXY_HOST/PANEL_HOST 必须配置）
+          # PANEL_PATH 是 3x-ui 面板 webBasePath，非敏感，保留默认值
           export PANEL_PATH="${PANEL_PATH:-/618fead1/}"
-          export INSTABOX_SSH_USER="${INSTABOX_SSH_USER:-ibssh_3gzc4jpx7fuix6bduacjvqgylq}"
           sh scripts/proxy_check.sh
 
       # ---- 链式触发下一轮（主调度通道）----
