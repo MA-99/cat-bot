@@ -269,14 +269,14 @@ elif [ "$PROXY_OK" = "false" ]; then
 	fi
 fi
 
-# 2. Issue 告警
+# 2. Issue 告警（首次开 + 恢复关，中间不评论，避免每轮邮件噪音）
 EXISTING=$(find_alert_issue)
 if [ "$PROXY_OK" = "false" ]; then
-	ISSUE_BODY=$(printf '## ⚠️ InstaBox 代理不可达\n\n**时间**: %s\n**代理 WebSocket**: %s\n**面板**: HTTP %s\n\n**恢复操作**: %s\n\n---\n此 Issue 由 keepalive workflow 自动创建。代理恢复后会自动关闭。' \
-		"$NOW" "$WS_RESULT" "$PANEL_CODE" "${RECOVERY_MSG:-}")
 	if [ -n "$EXISTING" ]; then
-		alert_comment "$EXISTING" "更新 $NOW: ${RECOVERY_MSG:-}"
+		log "  代理仍不可达，告警 Issue #$EXISTING 保持 open（不每轮评论，避免噪音）"
 	else
+		ISSUE_BODY=$(printf '## ⚠️ InstaBox 代理不可达\n\n**时间**: %s\n**代理 WebSocket**: %s\n**面板**: HTTP %s\n\n**恢复操作**: %s\n\n---\n此 Issue 由 keepalive workflow 自动创建。代理恢复后会自动关闭。' \
+			"$NOW" "$WS_RESULT" "$PANEL_CODE" "${RECOVERY_MSG:-}")
 		alert_open '⚠️ 代理不可达告警' "$ISSUE_BODY"
 	fi
 elif [ -n "$EXISTING" ]; then
