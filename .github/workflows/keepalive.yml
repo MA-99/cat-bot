@@ -93,6 +93,7 @@ jobs:
           PANEL_HOST: ${{ vars.PANEL_HOST }}
           PANEL_PATH: ${{ vars.PANEL_PATH }}
           FORCE_RESTART: ${{ inputs.mode == 'restart' && '1' || '0' }}
+          READONLY: ${{ (inputs.mode == 'status' || inputs.mode == 'release') && '1' || '0' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
@@ -117,16 +118,14 @@ jobs:
             && echo "链式触发成功：下一轮已排队" \
             || echo "链式触发失败（下个 schedule 兜底会重燃）"
 
-      # ---- 汇总判定：核心步骤失败 → run 显红（触发失败邮件通知）----
+      # ---- 汇总判定：仅 keepalive 核心失败才让 run 显红（触发失败邮件）----
+      # 代理不可达走 Issue 告警通道（proxy_check 已开/更新 Issue），run 保持 success
+      # 让链式持续运转；只有续租/轮转/自愈失败才中断告警
       - name: Report result
         if: always()
         run: |
           if [ "${{ steps.ka.outcome }}" = "failure" ]; then
-            echo "❌ keepalive 核心步骤失败（续租/轮转），详见上方日志"
+            echo "❌ keepalive 核心步骤失败（续租/轮转/自愈），详见上方日志"
             exit 1
           fi
-          if [ "${{ steps.proxy.outcome }}" = "failure" ]; then
-            echo "❌ 代理不可达且自动恢复失败，详见上方日志与告警 Issue"
-            exit 1
-          fi
-          echo "✅ 本轮完成：续租/轮转正常，代理可达"
+          echo "✅ 本轮完成（mode=${{ inputs.mode || 'keepalive' }}）"

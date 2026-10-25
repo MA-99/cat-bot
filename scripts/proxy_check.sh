@@ -36,6 +36,7 @@ SSH_USER=${INSTABOX_SSH_USER:-}
 REPO=${REPO:-}
 GH_TOKEN=${GH_TOKEN:-}
 FORCE_RESTART=${FORCE_RESTART:-0}
+READONLY=${READONLY:-0}   # =1 时只检查不恢复不告警（status/release 模式用）
 
 log() { printf '[proxy] %s\n' "$*"; }
 
@@ -226,7 +227,9 @@ if ws_ok "$WS_RESULT"; then PROXY_OK=true; fi
 if ws_limited "$WS_RESULT"; then PROXY_OK=true; log "  (429 限速，服务在线)"; fi
 
 RECOVERY_MSG=""
-if [ "$PROXY_OK" = "false" ]; then
+if [ "$PROXY_OK" = "false" ] && [ "$READONLY" = "1" ]; then
+	log "⚠️ 代理不可达（只读模式，不触发恢复与告警）"
+elif [ "$PROXY_OK" = "false" ]; then
 	log "⚠️ 代理不可达，启动恢复流程..."
 
 	# a. 机器不在 running → 唤醒（多台全处理）
@@ -283,5 +286,10 @@ else
 fi
 
 log "=== 完成 $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
+# 退出码语义：
+#   代理可达 / 只读模式 / 已通过 Issue 告警 → exit 0（run 保持 success，链式持续不吵）
+#   代理不可达且无法告警（无 GH_TOKEN/REPO）→ exit 1（用 run 显红兜底）
 [ "$PROXY_OK" = "true" ] && exit 0
+[ "$READONLY" = "1" ] && exit 0
+[ -n "$GH_TOKEN" ] && [ -n "$REPO" ] && exit 0
 exit 1
