@@ -1,303 +1,132 @@
 name: InstaBox Keepalive
 
+# 看门狗主 workflow —— 三层调度设计：
+#
+#   1. 链式自我触发（主通道）：每轮 run 结束前用 GITHUB_TOKEN dispatch 自己，
+#      间隔稳定约 4 分钟。GitHub 官方文档明确 workflow_dispatch 事件可以被
+#      GITHUB_TOKEN 触发（是「不触发新 run」规则的唯二例外之一）。
+#      为什么不用纯 schedule：实测本仓库 */9 的 cron 被 GitHub 调度饥饿压制到
+#      每 4~5 小时才执行一次，租约早过期了。
+#   2. schedule 兜底（*/30）：链式断掉（API 限流/失败）时重新点火。
+#      即使调度饥饿延迟数小时，也能保证链最终重燃。
+#   3. 手动 dispatch：mode = keepalive / status / release / restart。
+#
+# 每轮对机器做：
+#   - 续租 activity lease（TTL 3600s，压住空闲 30 分钟挂起）
+#   - 距 8 小时运行上限 ≤ 30 分钟 → 主动 suspend → resume 清零计时（不吃 10 分钟冷却）
+#   - 机器已被平台挂起 → 自动唤醒；冷却中 → 按 cooldownUntil 等待后唤醒
+#   - 3x-ui 代理健康检查 → 不可达时自动恢复（API 唤醒 + SSH 容器/端口级自愈）
+#     + GitHub Issue 告警
+
 on:
   schedule:
-    # 每 9 分钟续租 + 健康检查
-    - cron: '*/9 * * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
-      action:
-        description: '执行动作：keepalive（默认）| restart'
+      mode:
+        description: '运行模式'
         required: false
         default: 'keepalive'
+        type: choice
+        options:
+          - keepalive
+          - status
+          - release
+          - restart
 
 permissions:
   contents: read
-  issues: write
+  actions: write   # 链式 dispatch 自己
+  issues: write    # 代理告警 Issue
+
+# 排队不取消：上一轮可能正处于 suspend → resume 轮转中，中断会留下挂起的机器；
+# 排队也让链式触发天然串行，不会叠加
+concurrency:
+  group: instabox-keepalive
+  cancel-in-progress: false
 
 jobs:
-  keepalive:
+  watchdog:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
-      - name: Keepalive + Health Check + Auto-Recovery
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- 看门狗核心：续租 + 8h 轮转 + 冷却自愈（scripts/keepalive.sh）----
+      - name: Keepalive (lease / 8h cycle / cooldown recovery)
+        id: ka
+        continue-on-error: true   # 失败也继续跑代理检查与续链（本步骤显红）
         env:
           INSTABOX_API_KEY: ${{ secrets.INSTABOX_API_KEY }}
-          INSTABOX_SSH_KEY: ${{ secrets.INSTABOX_SSH_KEY }}
+          INSTABOX_MACHINE: ${{ vars.INSTABOX_MACHINE }}
+          INSTABOX_LEASE: ${{ vars.INSTABOX_LEASE }}
+          INSTABOX_LEASE_TTL: ${{ vars.INSTABOX_LEASE_TTL }}
+          INSTABOX_CYCLE: ${{ vars.INSTABOX_CYCLE }}
+          INSTABOX_CYCLE_MARGIN: ${{ vars.INSTABOX_CYCLE_MARGIN }}
+          INSTABOX_CYCLE_HOLD_MIN: ${{ vars.INSTABOX_CYCLE_HOLD_MIN }}
+          INSTABOX_CYCLE_HOLD_MAX: ${{ vars.INSTABOX_CYCLE_HOLD_MAX }}
+          INSTABOX_COOLDOWN_WAIT_MAX: ${{ vars.INSTABOX_COOLDOWN_WAIT_MAX }}
+          INSTABOX_API_URL: ${{ vars.INSTABOX_API_URL }}
+        run: |
+          MODE='${{ inputs.mode }}'
+          case "$MODE" in
+            status)  exec sh scripts/keepalive.sh --status ;;
+            release) exec sh scripts/keepalive.sh --release ;;
+            *)       exec sh scripts/keepalive.sh ;;
+          esac
+
+      # ---- 3x-ui 代理健康检查 + 自动恢复 + Issue 告警（scripts/proxy_check.sh）----
+      - name: Proxy health check + auto recovery
+        id: proxy
+        if: always()
+        continue-on-error: true
+        env:
+          INSTABOX_API_KEY: ${{ secrets.INSTABOX_API_KEY }}
           INSTABOX_API_URL: https://api.instabox.sh
+          INSTABOX_SSH_KEY: ${{ secrets.INSTABOX_SSH_KEY }}
           INSTABOX_SSH_HOST: api.instabox.sh
           INSTABOX_SSH_PORT: '2222'
-          INSTABOX_SSH_USER: ibssh_3gzc4jpx7fuix6bduacjvqgylq
-          PROXY_HOST: 8443-agqvx7j2hautskdu3rml3giune.instabox.tech
-          PROXY_PATH: /v1s2n8x4q7
-          PANEL_HOST: 2053-agqvx7j2hautskdu3rml3giune.instabox.tech
-          PANEL_PATH: /618fead1/
-          ACTION: ${{ github.event.inputs.action }}
+          INSTABOX_SSH_USER: ${{ vars.INSTABOX_SSH_USER }}
+          PROXY_HOST: ${{ vars.PROXY_HOST }}
+          PROXY_PATH: ${{ vars.PROXY_PATH }}
+          PANEL_HOST: ${{ vars.PANEL_HOST }}
+          PANEL_PATH: ${{ vars.PANEL_PATH }}
+          FORCE_RESTART: ${{ inputs.mode == 'restart' && '1' || '0' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          set -euo pipefail
-          API="$INSTABOX_API_URL"
-          KEY="$INSTABOX_API_KEY"
-          NOW=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
-          echo "=== InstaBox Keepalive $NOW ==="
+          # 旧版硬编码的地址作为默认值（仓库未配置 vars 时兜底）
+          export PROXY_HOST="${PROXY_HOST:-8443-agqvx7j2hautskdu3rml3giune.instabox.tech}"
+          export PROXY_PATH="${PROXY_PATH:-/v1s2n8x4q7}"
+          export PANEL_HOST="${PANEL_HOST:-2053-agqvx7j2hautskdu3rml3giune.instabox.tech}"
+          export PANEL_PATH="${PANEL_PATH:-/618fead1/}"
+          export INSTABOX_SSH_USER="${INSTABOX_SSH_USER:-ibssh_3gzc4jpx7fuix6bduacjvqgylq}"
+          sh scripts/proxy_check.sh
 
-          # ============================================================
-          # 1. 获取机器列表 + 续租
-          # ============================================================
-          RESP=$(curl -sf -m 30 -X GET "$API/v1/machines" \
-            -H "X-API-Key: $KEY" -H "Accept: application/json" \
-            -w '\n%{http_code}') || { echo "❌ 获取机器列表失败"; exit 1; }
-          HTTP_CODE=$(echo "$RESP" | tail -1)
-          BODY=$(echo "$RESP" | sed '$d')
-          [ "$HTTP_CODE" = "200" ] || { echo "❌ API 返回 $HTTP_CODE"; exit 1; }
+      # ---- 链式触发下一轮（主调度通道）----
+      # sleep 150s 控制节奏：每轮约 4 分钟，一天约 360 轮（public 仓库免费不限分钟）
+      - name: Chain next run
+        if: always() && (github.event_name == 'schedule' || inputs.mode == 'keepalive' || inputs.mode == '')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          sleep 150
+          gh workflow run keepalive.yml -R "$REPO" -f mode=keepalive \
+            && echo "链式触发成功：下一轮已排队" \
+            || echo "链式触发失败（下个 schedule 兜底会重燃）"
 
-          MACHINE_INFO=$(echo "$BODY" | python3 -c "
-          import json, sys
-          data = json.load(sys.stdin)
-          for m in (data.get('machines') or []):
-              print(f\"{m['id']}\t{m.get('name','')}\t{m.get('state','')}\")
-          ")
-          echo "$MACHINE_INFO" | while IFS=$'\t' read -r mid name state; do
-            echo "  机器: $name ($mid) [$state]"
-          done
-
-          MID=$(echo "$MACHINE_INFO" | head -1 | cut -f1)
-          MNAME=$(echo "$MACHINE_INFO" | head -1 | cut -f2)
-          MSTATE=$(echo "$MACHINE_INFO" | head -1 | cut -f3)
-
-          # 续租
-          RENEW=$(curl -s -m 30 -X PUT "$API/v1/machines/$MID/activity-leases/keepalive" \
-            -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
-            -d '{"ttlSeconds":300}' -w '\n%{http_code}')
-          RCODE=$(echo "$RENEW" | tail -1)
-          if [ "$RCODE" = "200" ] || [ "$RCODE" = "204" ]; then
-            echo "✅ 续租成功"
-          else
-            echo "❌ 续租失败 HTTP $RCODE"
+      # ---- 汇总判定：核心步骤失败 → run 显红（触发失败邮件通知）----
+      - name: Report result
+        if: always()
+        run: |
+          if [ "${{ steps.ka.outcome }}" = "failure" ]; then
+            echo "❌ keepalive 核心步骤失败（续租/轮转），详见上方日志"
+            exit 1
           fi
-
-          # ============================================================
-          # 2. 代理健康检查
-          # ============================================================
-          echo ""
-          echo "--- 代理健康检查 ---"
-
-          # 代理检查：用 python 做完整 WebSocket 握手
-          WS_RESULT=$(python3 -c "
-          import socket, ssl, base64, os, sys
-          host = '$PROXY_HOST'
-          try:
-              ctx = ssl.create_default_context()
-              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-              s.settimeout(10)
-              ss = ctx.wrap_socket(s, server_hostname=host)
-              ss.connect((host, 443))
-              key = base64.b64encode(os.urandom(16)).decode()
-              req = (
-                  'GET $PROXY_PATH HTTP/1.1\r\n'
-                  'Host: ' + host + '\r\n'
-                  'Upgrade: websocket\r\n'
-                  'Connection: Upgrade\r\n'
-                  'Sec-WebSocket-Key: ' + key + '\r\n'
-                  'Sec-WebSocket-Version: 13\r\n'
-                  '\r\n'
-              )
-              ss.sendall(req.encode())
-              resp = ss.recv(4096).decode(errors='replace')
-              status = resp.split('\r\n')[0] if resp else 'empty'
-              print(status)
-              ss.close()
-          except Exception as e:
-              print('ERROR: ' + str(e))
-          " 2>&1) || WS_RESULT="ERROR: python failed"
-
-          # 面板检查
-          PANEL_CODE=$(curl -s -o /dev/null -m 10 -w '%{http_code}' \
-            "https://$PANEL_HOST$PANEL_PATH" 2>/dev/null) || PANEL_CODE="000"
-
-          echo "  代理 WebSocket: $WS_RESULT"
-          echo "  面板: HTTP $PANEL_CODE (期望 200)"
-
-          # 判断代理是否正常
-          PROXY_OK=false
-          if echo "$WS_RESULT" | grep -q "101 Switching"; then
-            PROXY_OK=true
+          if [ "${{ steps.proxy.outcome }}" = "failure" ]; then
+            echo "❌ 代理不可达且自动恢复失败，详见上方日志与告警 Issue"
+            exit 1
           fi
-          # 429 = 限速但服务在线，也算正常
-          if echo "$WS_RESULT" | grep -q "429"; then
-            PROXY_OK=true
-            echo "  (429 限速，服务在线)"
-          fi
-
-          # 手动重启请求
-          if [ "${ACTION:-}" = "restart" ]; then
-            echo ""
-            echo "=== 手动触发重启 ==="
-            curl -s -m 30 -X POST "$API/v1/machines/$MID/restart" \
-              -H "X-API-Key: $KEY" -o /dev/null -w "  restart -> HTTP %{http_code}\n" 2>/dev/null || true
-            sleep 30
-            PROXY_OK=false
-            RECOVERY_MSG="手动重启已执行"
-          fi
-
-          # ============================================================
-          # 3. 自动恢复
-          # ============================================================
-          RECOVERY_MSG=""
-          if [ "$PROXY_OK" = "false" ]; then
-            echo ""
-            echo "⚠️ 代理不可达，启动恢复流程..."
-
-            # 3a. 如果机器不在 running，尝试唤醒
-            if [ "$MSTATE" != "running" ]; then
-              echo "  机器状态: $MSTATE，尝试唤醒..."
-              curl -s -m 30 -X POST "$API/v1/machines/$MID/resume" \
-                -H "X-API-Key: $KEY" -o /dev/null -w "  resume -> HTTP %{http_code}\n" 2>/dev/null || \
-              curl -s -m 30 -X POST "$API/v1/machines/$MID/start" \
-                -H "X-API-Key: $KEY" -o /dev/null -w "  start -> HTTP %{http_code}\n" 2>/dev/null || true
-
-              for i in 1 2 3 4 5 6; do
-                sleep 10
-                ST=$(curl -sf -m 10 "$API/v1/machines/$MID" \
-                  -H "X-API-Key: $KEY" 2>/dev/null | \
-                  python3 -c "import json,sys; print(json.load(sys.stdin).get('state',''))" 2>/dev/null) || ST=""
-                echo "  等待... ($i) state=$ST"
-                [ "$ST" = "running" ] && break
-              done
-            fi
-
-            # 3b. SSH 恢复（如果有 SSH key）
-            if [ -n "$INSTABOX_SSH_KEY" ]; then
-              echo "  通过 SSH 恢复..."
-              mkdir -p ~/.ssh
-              echo "$INSTABOX_SSH_KEY" > ~/.ssh/id_ed25519
-              chmod 600 ~/.ssh/id_ed25519
-              ssh-keyscan -p "$INSTABOX_SSH_PORT" "$INSTABOX_SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
-
-              SSH_CMD="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p $INSTABOX_SSH_PORT $INSTABOX_SSH_USER@$INSTABOX_SSH_HOST"
-
-              echo "  检查 Docker 容器..."
-              DOCKER_STATUS=$($SSH_CMD 'docker ps --format "{{.Names}} {{.Status}}" 2>/dev/null' 2>/dev/null) || DOCKER_STATUS=""
-              echo "  Docker: $DOCKER_STATUS"
-
-              if echo "$DOCKER_STATUS" | grep -q "3x-ui.*Up"; then
-                echo "  容器正常，重新发布端口..."
-                $SSH_CMD 'instabox-port publish 2053 --name 3xui-panel 2>/dev/null; instabox-port publish 8443 --name vless-ws 2>/dev/null' 2>/dev/null || true
-                RECOVERY_MSG="端口已重新发布"
-              else
-                echo "  容器异常，尝试重启..."
-                $SSH_CMD 'docker restart 3x-ui 2>/dev/null; sleep 5; instabox-port publish 2053 --name 3xui-panel 2>/dev/null; instabox-port publish 8443 --name vless-ws 2>/dev/null' 2>/dev/null || true
-                RECOVERY_MSG="Docker 已重启，端口已重新发布"
-              fi
-            else
-              RECOVERY_MSG="无 SSH key，仅执行 API 级恢复。添加 INSTABOX_SSH_KEY secret 可启用自动重发布"
-            fi
-
-            # 3c. 再次检查
-            sleep 5
-            WS_RESULT2=$(python3 -c "
-          import socket, ssl, base64, os
-          host = '$PROXY_HOST'
-          try:
-              ctx = ssl.create_default_context()
-              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-              s.settimeout(10)
-              ss = ctx.wrap_socket(s, server_hostname=host)
-              ss.connect((host, 443))
-              key = base64.b64encode(os.urandom(16)).decode()
-              req = (
-                  'GET $PROXY_PATH HTTP/1.1\r\n'
-                  'Host: ' + host + '\r\n'
-                  'Upgrade: websocket\r\n'
-                  'Connection: Upgrade\r\n'
-                  'Sec-WebSocket-Key: ' + key + '\r\n'
-                  'Sec-WebSocket-Version: 13\r\n'
-                  '\r\n'
-              )
-              ss.sendall(req.encode())
-              resp = ss.recv(4096).decode(errors='replace')
-              print(resp.split('\r\n')[0] if resp else 'empty')
-              ss.close()
-          except Exception as e:
-              print('ERROR: ' + str(e))
-          " 2>&1) || WS_RESULT2="ERROR"
-            echo "  恢复后检查: $WS_RESULT2"
-
-            if echo "$WS_RESULT2" | grep -q "101 Switching"; then
-              echo "  ✅ 代理已恢复"
-              PROXY_OK=true
-              RECOVERY_MSG="✅ 已自动恢复: $RECOVERY_MSG"
-            else
-              echo "  ❌ 代理仍未恢复"
-              RECOVERY_MSG="❌ 恢复失败: $RECOVERY_MSG"
-            fi
-          fi
-
-          # ============================================================
-          # 4. 通知（通过 GitHub Issue）
-          # ============================================================
-          echo ""
-          echo "--- 通知检查 ---"
-
-          # 查找已有的 open 告警 issue
-          EXISTING=$(curl -sf -m 10 "https://api.github.com/repos/$REPO/issues?state=open&labels=keepalive-alert" \
-            -H "Authorization: token $GH_TOKEN" 2>/dev/null | python3 -c "
-            import json, sys
-            issues = json.load(sys.stdin)
-            print(issues[0]['number'] if issues else '')
-            " 2>/dev/null) || EXISTING=""
-
-          if [ "$PROXY_OK" = "false" ]; then
-            ISSUE_BODY="## ⚠️ InstaBox 代理不可达
-
-          **时间**: $NOW
-          **机器**: $MNAME ($MID)
-          **代理 WebSocket**: $WS_RESULT
-          **面板**: HTTP $PANEL_CODE
-
-          **恢复操作**: $RECOVERY_MSG
-
-          ---
-          此 Issue 由 keepalive workflow 自动创建。代理恢复后会自动关闭。"
-
-            if [ -n "$EXISTING" ]; then
-              # 更新现有 issue
-              COMMENT_BODY="更新 $(date -u '+%Y-%m-%d %H:%M:%S UTC'): $RECOVERY_MSG"
-              curl -sf -m 10 -X POST \
-                "https://api.github.com/repos/$REPO/issues/$EXISTING/comments" \
-                -H "Authorization: token $GH_TOKEN" \
-                -H "Content-Type: application/json" \
-                -d "$(python3 -c "import json; print(json.dumps({'body': '''$COMMENT_BODY'''}))")" 2>/dev/null && \
-                echo "  已更新 Issue #$EXISTING"
-            else
-              # 创建新 issue
-              curl -sf -m 10 -X POST \
-                "https://api.github.com/repos/$REPO/issues" \
-                -H "Authorization: token $GH_TOKEN" \
-                -H "Content-Type: application/json" \
-                -d "$(python3 -c "
-          import json
-          print(json.dumps({
-              'title': '⚠️ 代理不可达告警',
-              'body': '''$ISSUE_BODY''',
-              'labels': ['keepalive-alert', 'bug']
-          }))
-          ")" 2>/dev/null && echo "  已创建告警 Issue"
-            fi
-          else
-            # 代理正常，关闭告警
-            if [ -n "$EXISTING" ]; then
-              curl -sf -m 10 -X PATCH \
-                "https://api.github.com/repos/$REPO/issues/$EXISTING" \
-                -H "Authorization: token $GH_TOKEN" \
-                -H "Content-Type: application/json" \
-                -d '{"state":"closed","labels":["keepalive-alert","resolved"]}' 2>/dev/null && \
-                echo "  ✅ 代理已恢复，关闭告警 Issue #$EXISTING"
-            else
-              echo "  ✅ 一切正常"
-            fi
-          fi
-
-          echo ""
-          echo "=== 完成 $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
+          echo "✅ 本轮完成：续租/轮转正常，代理可达"

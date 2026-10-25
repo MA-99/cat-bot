@@ -1,0 +1,32 @@
+name: Repo Keepalive
+
+# GitHub 会把「60 天内没有任何 push」的仓库上的 scheduled workflow 自动禁用。
+# 本仓库的 InstaBox Keepalive 依赖 schedule 作为兜底点火器，必须保持启用。
+# 这个 workflow 每月 1 号推一个空提交，保证定时任务永远活着。
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: repo-keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Push empty commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive commit (prevent scheduled workflow auto-disable)"
+          git push
