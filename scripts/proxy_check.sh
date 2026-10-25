@@ -40,40 +40,21 @@ READONLY=${READONLY:-0}   # =1 时只检查不恢复不告警（status/release �
 
 log() { printf '[proxy] %s\n' "$*"; }
 
-# ---- WebSocket 握手检查（429 = 限速但服务在线，视为正常）------------------------
-ws_check() { # -> 打印首行响应或 ERROR: ...
+# ---- 代理可达性检查（vless-reality = TCP over TLS，只需 TCP 443 连通）--------
+proxy_check() { # -> 打印 OK 或 ERROR: ...
 	python3 - <<'PYEOF' 2>&1 || printf 'ERROR: python failed'
-import os, socket, ssl, base64
-
-host = os.environ["WS_HOST"]
-path = os.environ["WS_PATH"]
+import os, socket
+host = os.environ["PROXY_HOST_ADDR"]
 try:
-    ctx = ssl.create_default_context()
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(10)
-    ss = ctx.wrap_socket(s, server_hostname=host)
-    ss.connect((host, 443))
-    key = base64.b64encode(os.urandom(16)).decode()
-    req = (
-        "GET " + path + " HTTP/1.1\r\n"
-        "Host: " + host + "\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Key: " + key + "\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        "\r\n"
-    )
-    ss.sendall(req.encode())
-    resp = ss.recv(4096).decode(errors="replace")
-    print(resp.split("\r\n")[0] if resp else "empty")
-    ss.close()
+    s = socket.create_connection((host, 443), timeout=8)
+    s.close()
+    print("OK")
 except Exception as e:
     print("ERROR: " + str(e))
 PYEOF
 }
 
-ws_ok() { printf '%s' "$1" | grep -q '101 Switching'; }
-ws_limited() { printf '%s' "$1" | grep -q '429'; }
+proxy_ok() { printf '%s' "$1" | grep -q '^OK'; }
 
 # ---- InstaBox API 小工具 --------------------------------------------------------
 api_get_machines() {
@@ -215,16 +196,15 @@ if [ "$FORCE_RESTART" = "1" ] && [ -n "$KEY" ]; then
 fi
 
 # 1. 检查代理 + 面板
-export WS_HOST=$PROXY_HOST WS_PATH=$PROXY_PATH
-WS_RESULT=$(ws_check)
+export PROXY_HOST_ADDR=$PROXY_HOST
+PROXY_RESULT=$(proxy_check)
 PANEL_CODE=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "https://$PANEL_HOST$PANEL_PATH" 2>/dev/null) || PANEL_CODE="000"
 
-log "  代理 WebSocket: $WS_RESULT"
-log "  面板: HTTP $PANEL_CODE (期望 200)"
+log "  代理 TCP: $PROXY_RESULT"
+log "  面板: HTTP $PANEL_CODE"
 
 PROXY_OK=false
-if ws_ok "$WS_RESULT"; then PROXY_OK=true; fi
-if ws_limited "$WS_RESULT"; then PROXY_OK=true; log "  (429 限速，服务在线)"; fi
+if proxy_ok "$PROXY_RESULT"; then PROXY_OK=true; fi
 
 RECOVERY_MSG=""
 if [ "$PROXY_OK" = "false" ] && [ "$READONLY" = "1" ]; then
@@ -253,16 +233,12 @@ elif [ "$PROXY_OK" = "false" ]; then
 
 	# c. 复检
 	sleep 5
-	WS_RESULT2=$(ws_check)
-	log "  恢复后检查: $WS_RESULT2"
-	if ws_ok "$WS_RESULT2"; then
+	PROXY_RESULT2=$(proxy_check)
+	log "  恢复后检查: $PROXY_RESULT2"
+	if proxy_ok "$PROXY_RESULT2"; then
 		log "  ✅ 代理已恢复"
 		PROXY_OK=true
 		RECOVERY_MSG="✅ 已自动恢复: ${RECOVERY_MSG:-SSH/API 级恢复}"
-	elif ws_limited "$WS_RESULT2"; then
-		log "  ✅ 代理已恢复（429 限速）"
-		PROXY_OK=true
-		RECOVERY_MSG="✅ 已自动恢复（429 限速）: ${RECOVERY_MSG:-}"
 	else
 		log "  ❌ 代理仍未恢复"
 		RECOVERY_MSG="❌ 恢复失败: ${RECOVERY_MSG:-}"
@@ -275,8 +251,8 @@ if [ "$PROXY_OK" = "false" ]; then
 	if [ -n "$EXISTING" ]; then
 		log "  代理仍不可达，告警 Issue #$EXISTING 保持 open（不每轮评论，避免噪音）"
 	else
-		ISSUE_BODY=$(printf '## ⚠️ InstaBox 代理不可达\n\n**时间**: %s\n**代理 WebSocket**: %s\n**面板**: HTTP %s\n\n**恢复操作**: %s\n\n---\n此 Issue 由 keepalive workflow 自动创建。代理恢复后会自动关闭。' \
-			"$NOW" "$WS_RESULT" "$PANEL_CODE" "${RECOVERY_MSG:-}")
+		ISSUE_BODY=$(printf '## ⚠️ InstaBox 代理不可达\n\n**时间**: %s\n**代理 TCP**: %s\n**面板**: HTTP %s\n\n**恢复操作**: %s\n\n---\n此 Issue 由 keepalive workflow 自动创建。代理恢复后会自动关闭。' \
+			"$NOW" "$PROXY_RESULT" "$PANEL_CODE" "${RECOVERY_MSG:-}")
 		alert_open '⚠️ 代理不可达告警' "$ISSUE_BODY"
 	fi
 elif [ -n "$EXISTING" ]; then
